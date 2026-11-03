@@ -1,0 +1,134 @@
+name: Deploy Wiki.js (live)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: wikijs-live
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY: asendio-wiki
+  ECS_CLUSTER: asendio-live
+  ECS_SERVICE: asendio-live-wiki
+
+jobs:
+  build-and-deploy:
+    name: Build, push, and deploy
+    runs-on: ubuntu-latest
+    environment: live
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 26.x
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build blocks
+        working-directory: blocks
+        run: |
+          npm ci
+          npm run build
+
+      - name: Set version
+        id: version
+        run: |
+          TIMESTAMP=$(date +'%Y%m%d%H%M')
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          echo "tag=v${TIMESTAMP}-${COMMIT_HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-wikijs-live
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: dev/build/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to ECS
+        run: |
+          set -euo pipefail
+
+          aws ecs update-service \
+            --cluster "${ECS_CLUSTER}" \
+            --service "${ECS_SERVICE}" \
+            --force-new-deployment \
+            --region "${AWS_REGION}" \
+            --no-cli-pager
+
+          echo "Waiting for ECS service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster "${ECS_CLUSTER}" \
+            --services "${ECS_SERVICE}" \
+            --region "${AWS_REGION}"
+
+      - name: Verify target health
+        run: |
+          set -euo pipefail
+
+          TG_ARN=$(aws elbv2 describe-target-groups \
+            --region "${AWS_REGION}" \
+            --query "TargetGroups[?contains(TargetGroupName, 'asendio-live-wiki')].TargetGroupArn | [0]" \
+            --output text)
+
+          if [[ -z "${TG_ARN}" || "${TG_ARN}" == "None" ]]; then
+            echo "Warning: Wiki.js target group not found; skipping ALB health check."
+            exit 0
+          fi
+
+          for attempt in $(seq 1 12); do
+            HEALTH=$(aws elbv2 describe-target-health \
+              --target-group-arn "${TG_ARN}" \
+              --region "${AWS_REGION}" \
+              --query "TargetHealthDescriptions[?TargetHealth.State=='healthy'] | length(@)" \
+              --output text)
+
+            echo "Healthy targets: ${HEALTH} (attempt ${attempt}/12)"
+
+            if [[ "${HEALTH}" != "0" ]]; then
+              exit 0
+            fi
+
+            sleep 15
+          done
+
+          echo "No healthy ALB targets after deploy."
+          aws elbv2 describe-target-health \
+            --target-group-arn "${TG_ARN}" \
+            --region "${AWS_REGION}"
+          exit 1
